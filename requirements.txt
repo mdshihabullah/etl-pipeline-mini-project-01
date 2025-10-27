@@ -1,0 +1,8 @@
+pydantic-settings
+mastodon-py
+requests
+tenacity
+polars
+psycopg[binary]
+transformers
+torch

@@ -1,0 +1,138 @@
+services:
+  # PostgreSQL Database Service
+  postgres:
+    image: postgres:16-alpine  # Latest stable PostgreSQL (Alpine for smaller footprint)
+    container_name: mastodon_postgres
+    restart: unless-stopped
+    
+    environment:
+      # Use variables from settings.env
+      POSTGRES_DB: ${DATABASE_NAME:-mastodon_toots}
+      POSTGRES_USER: ${DATABASE_USER:-postgres}
+      POSTGRES_PASSWORD: ${DATABASE_PASSWORD:-postgres}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+      # Security: Use strong password authentication
+      POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+      # Performance tuning
+      POSTGRES_MAX_CONNECTIONS: "100"
+      POSTGRES_SHARED_BUFFERS: "256MB"
+      POSTGRES_EFFECTIVE_CACHE_SIZE: "1GB"
+      POSTGRES_WORK_MEM: "16MB"
+      # Custom variable for init scripts
+      DATABASE_SCHEMA_NAME: ${DATABASE_SCHEMA_NAME:-mastodon_toots}
+    
+    ports:
+      - "${DATABASE_PORT:-5432}:5432"
+    
+    volumes:
+      # Persist data
+      - postgres_data:/var/lib/postgresql/data
+      # Custom initialization scripts (only for base setup, medallion models applied via Python)
+      - ./models:/docker-entrypoint-initdb.d:ro
+    
+    networks:
+      - mastodon_network
+    
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DATABASE_USER:-postgres} -d ${DATABASE_NAME:-mastodon_toots}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    
+    # Resource limits (sufficient for moderate workloads)
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 4G
+        reservations:
+          cpus: '1.0'
+          memory: 1G
+    
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Metabase Visualization Service
+  metabase:
+    image: metabase/metabase:v0.50.9  # Latest stable version (verified)
+    container_name: mastodon_metabase
+    restart: unless-stopped
+    
+    environment:
+      # Metabase configuration
+      MB_DB_TYPE: postgres
+      MB_DB_DBNAME: metabase
+      MB_DB_PORT: 5432
+      MB_DB_USER: ${DATABASE_USER:-postgres}
+      MB_DB_PASS: ${DATABASE_PASSWORD:-postgres}
+      MB_DB_HOST: postgres
+      # Java heap size (adjusted for memory limits)
+      JAVA_OPTS: "-Xmx2g -XX:+UseG1GC -XX:MaxGCPauseMillis=200"
+      # Security - IMPORTANT: Set this in settings.env
+      MB_ENCRYPTION_SECRET_KEY: ${METABASE_SECRET_KEY:-CHANGE_ME_IN_PRODUCTION_ASAP}
+      # Session timeout (24 hours)
+      MAX_SESSION_AGE: "1440"
+    
+    ports:
+      - "3000:3000"
+    
+    volumes:
+      # Persist Metabase data
+      - metabase_data:/metabase-data
+    
+    networks:
+      - mastodon_network
+    
+    depends_on:
+      postgres:
+        condition: service_healthy
+    
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+    
+    # Security: Run as non-root user (metabase user UID 2000)
+    user: "2000:2000"
+    
+    # Resource limits (increased for better performance)
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 3G
+        reservations:
+          cpus: '0.5'
+          memory: 1G
+    
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+# Named volumes for data persistence
+volumes:
+  postgres_data:
+    driver: local
+    name: mastodon_postgres_data
+  
+  metabase_data:
+    driver: local
+    name: mastodon_metabase_data
+
+# Dedicated network for service communication
+networks:
+  mastodon_network:
+    driver: bridge
+    name: mastodon_network
+    ipam:
+      config:
+        - subnet: 172.25.0.0/16
+
