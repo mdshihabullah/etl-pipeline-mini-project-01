@@ -47,27 +47,44 @@ class SilverLayerETL:
         
         try:
             with psycopg.connect(**self.db_config) as conn:
-                # Execute ETL steps in order
-                if not self._populate_dim_date(conn):
+                # Start transaction
+                conn.autocommit = False
+                
+                try:
+                    # Validate data quality first
+                    if not self._validate_fact_data(conn):
+                        logger.warning("Data validation warnings found, continuing...")
+                    
+                    # Execute ETL steps in order
+                    steps = [
+                        ("dim_date", self._populate_dim_date),
+                        ("dim_account", self._populate_dim_account_scd2),
+                        ("dim_content", self._populate_dim_content),
+                        ("dim_sentiment", self._populate_dim_sentiment),
+                        ("fact_toot_engagement", self._populate_fact_toot_engagement)
+                    ]
+                    
+                    for step_name, step_func in steps:
+                        logger.info(f"Executing {step_name}...")
+                        if not step_func(conn):
+                            logger.error(f"Failed at step: {step_name}")
+                            conn.rollback()
+                            return False
+                    
+                    # Cleanup orphaned records
+                    if not self._cleanup_orphaned_records(conn):
+                        logger.warning("Cleanup of orphaned records failed, continuing...")
+                    
+                    # Commit all changes
+                    conn.commit()
+                    logger.info("\n✅ Silver layer ETL completed successfully")
+                    return True
+                    
+                except Exception as e:
+                    logger.error(f"ETL failed, rolling back transaction: {e}")
+                    conn.rollback()
                     return False
-                
-                if not self._populate_dim_account_scd2(conn):
-                    return False
-                
-                if not self._populate_dim_content(conn):
-                    return False
-                
-                if not self._populate_dim_sentiment(conn):
-                    return False
-                
-                if not self._populate_fact_toot_engagement(conn):
-                    return False
-                
-                conn.commit()
-                
-                logger.info("\n✅ Silver layer ETL completed successfully")
-                return True
-                
+                    
         except psycopg.OperationalError as e:
             logger.error(f"Database connection failed: {e}")
             return False
@@ -329,11 +346,6 @@ class SilverLayerETL:
         logger.info("Populating fact_toot_engagement...")
         
         sql = f"""
-        INSERT INTO {self.silver_schema}.fact_toot_engagement (
-            toot_id, date_key, account_key, content_key, sentiment_key,
-            replies_count, reblogs_count, favourites_count, quotes_count,
-            total_engagement, visibility, language, created_at, edited_at
-        )
         WITH deduplicated_bronze AS (
             -- Keep only the most recent version of each toot (handles duplicates from multiple pipeline runs)
             SELECT DISTINCT ON (id)
@@ -352,34 +364,55 @@ class SilverLayerETL:
                 edited_at
             FROM {self.bronze_schema}.transformed_toots_with_sentiment_data
             ORDER BY id, ingestion_timestamp DESC
+        ),
+        fact_data AS (
+            SELECT 
+                b.id AS toot_id,
+                TO_CHAR(b.created_at, 'YYYYMMDD')::INTEGER AS date_key,
+                a.account_key,
+                c.content_key,
+                s.sentiment_key,
+                b.replies_count,
+                b.reblogs_count,
+                b.favourites_count,
+                b.quotes_count,
+                (COALESCE(b.replies_count, 0) + COALESCE(b.reblogs_count, 0) + 
+                 COALESCE(b.favourites_count, 0) + COALESCE(b.quotes_count, 0)) AS total_engagement,
+                b.visibility,
+                b.language,
+                b.created_at,
+                b.edited_at
+            FROM deduplicated_bronze b
+            LEFT JOIN {self.silver_schema}.dim_account a 
+                ON b.account_id = a.account_id AND a.is_current = TRUE
+            LEFT JOIN {self.silver_schema}.dim_content c 
+                ON b.id = c.toot_id
+            LEFT JOIN {self.silver_schema}.dim_sentiment s 
+                ON LOWER(b.sentiment_value) = LOWER(s.sentiment_value)
+                AND b.sentiment_model_name = s.sentiment_model_name
+                AND b.sentiment_score IS NOT NULL
+                AND b.sentiment_score >= s.sentiment_score_min
+                AND b.sentiment_score < s.sentiment_score_max
+        ),
+        -- Additional deduplication to ensure no duplicate toot_ids in the final result
+        final_data AS (
+            SELECT DISTINCT ON (toot_id)
+                toot_id, date_key, account_key, content_key, sentiment_key,
+                replies_count, reblogs_count, favourites_count, quotes_count,
+                total_engagement, visibility, language, created_at, edited_at
+            FROM fact_data
+            ORDER BY toot_id, created_at DESC
+        )
+        INSERT INTO {self.silver_schema}.fact_toot_engagement (
+            toot_id, date_key, account_key, content_key, sentiment_key,
+            replies_count, reblogs_count, favourites_count, quotes_count,
+            total_engagement, visibility, language, created_at, edited_at
         )
         SELECT 
-            b.id AS toot_id,
-            TO_CHAR(b.created_at, 'YYYYMMDD')::INTEGER AS date_key,
-            a.account_key,
-            c.content_key,
-            s.sentiment_key,
-            b.replies_count,
-            b.reblogs_count,
-            b.favourites_count,
-            b.quotes_count,
-            (COALESCE(b.replies_count, 0) + COALESCE(b.reblogs_count, 0) + 
-             COALESCE(b.favourites_count, 0) + COALESCE(b.quotes_count, 0)) AS total_engagement,
-            b.visibility,
-            b.language,
-            b.created_at,
-            b.edited_at
-        FROM deduplicated_bronze b
-        LEFT JOIN {self.silver_schema}.dim_account a 
-            ON b.account_id = a.account_id AND a.is_current = TRUE
-        LEFT JOIN {self.silver_schema}.dim_content c 
-            ON b.id = c.toot_id
-        LEFT JOIN {self.silver_schema}.dim_sentiment s 
-            ON LOWER(b.sentiment_value) = LOWER(s.sentiment_value)
-            AND b.sentiment_model_name = s.sentiment_model_name
-            AND b.sentiment_score IS NOT NULL
-            AND b.sentiment_score >= s.sentiment_score_min
-            AND b.sentiment_score < s.sentiment_score_max
+            toot_id, date_key, account_key, content_key, sentiment_key,
+            replies_count, reblogs_count, favourites_count, quotes_count,
+            total_engagement, visibility, language, created_at, edited_at
+        FROM final_data
         ON CONFLICT (toot_id) DO UPDATE SET
             replies_count = EXCLUDED.replies_count,
             reblogs_count = EXCLUDED.reblogs_count,
@@ -398,6 +431,71 @@ class SilverLayerETL:
                 return True
         except Exception as e:
             logger.error(f"  ❌ Failed to populate fact_toot_engagement: {e}")
+            return False
+    
+    def _validate_fact_data(self, conn: psycopg.Connection) -> bool:
+        """Validate data quality before insertion."""
+        logger.info("Validating fact data quality...")
+        
+        validation_queries = [
+            # Check for duplicate toot_ids in bronze layer
+            f"""
+            SELECT COUNT(*) as duplicate_count
+            FROM (
+                SELECT id, COUNT(*) as cnt
+                FROM {self.bronze_schema}.transformed_toots_with_sentiment_data
+                GROUP BY id
+                HAVING COUNT(*) > 1
+            ) duplicates
+            """,
+            
+            # Check for missing foreign key references
+            f"""
+            SELECT COUNT(*) as missing_account_keys
+            FROM {self.bronze_schema}.transformed_toots_with_sentiment_data b
+            LEFT JOIN {self.silver_schema}.dim_account a 
+                ON b.account_id = a.account_id AND a.is_current = TRUE
+            WHERE b.account_id IS NOT NULL AND a.account_key IS NULL
+            """
+        ]
+        
+        try:
+            with conn.cursor() as cur:
+                for i, query in enumerate(validation_queries):
+                    cur.execute(query)
+                    result = cur.fetchone()[0]
+                    if i == 0 and result > 0:
+                        logger.warning(f"  ⚠️  Found {result} duplicate toot_ids in bronze layer")
+                    elif i == 1 and result > 0:
+                        logger.warning(f"  ⚠️  Found {result} toots with missing account references")
+            return True
+        except Exception as e:
+            logger.error(f"  ❌ Data validation failed: {e}")
+            return False
+    
+    def _cleanup_orphaned_records(self, conn: psycopg.Connection) -> bool:
+        """Clean up orphaned records in fact table."""
+        logger.info("Cleaning up orphaned records...")
+        
+        cleanup_sql = f"""
+        DELETE FROM {self.silver_schema}.fact_toot_engagement f
+        WHERE NOT EXISTS (
+            SELECT 1 FROM {self.bronze_schema}.transformed_toots_with_sentiment_data b
+            WHERE b.id = f.toot_id
+        )
+        """
+        
+        try:
+            with conn.cursor() as cur:
+                cur.execute(cleanup_sql)
+                deleted_count = cur.rowcount
+                if deleted_count > 0:
+                    logger.info(f"  ✅ Cleaned up {deleted_count} orphaned records")
+                else:
+                    logger.info("  ✅ No orphaned records found")
+                return True
+        except Exception as e:
+            logger.error(f"  ❌ Failed to cleanup orphaned records: {e}")
             return False
     
     def get_silver_stats(self) -> Optional[dict]:
