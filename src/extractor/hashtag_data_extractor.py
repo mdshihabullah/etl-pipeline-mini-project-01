@@ -15,11 +15,7 @@ import logging
 import sys
 from .config import config
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+# Get logger (logging configuration handled in main.py)
 logger = logging.getLogger(__name__)
 
 class MastodonHashtagCrawler:

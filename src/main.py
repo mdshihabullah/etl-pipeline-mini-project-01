@@ -8,23 +8,12 @@ This script orchestrates the complete data pipeline:
 4. Notify: Send summary to Discord
 """
 
+# Configure logging FIRST before any imports
 import logging
-from datetime import datetime
-
-from extractor.hashtag_data_extractor import MastodonHashtagCrawler
-from transformer import MastodonDataTransformer
-from loader import (
-    BronzeLayerLoader,
-    SilverLayerETL,
-    GoldLayerRefresh,
-    ModelExecutor
-)
-from notifier import DiscordNotifier
-from extractor.config import config
-
-# Configure logging
 from pathlib import Path
 import sys
+from datetime import datetime
+
 log_dir = Path(__file__).parent.parent / 'logs'
 log_dir.mkdir(exist_ok=True)
 log_file = log_dir / f'pipeline_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'
@@ -38,6 +27,19 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+# Now import other modules (after logging configuration to prevent conflicts)
+# pylint: disable=wrong-import-position
+from extractor.hashtag_data_extractor import MastodonHashtagCrawler
+from transformer import MastodonDataTransformer
+from loader import (
+    BronzeLayerLoader,
+    SilverLayerETL,
+    GoldLayerRefresh,
+    ModelExecutor
+)
+from notifier import DiscordNotifier
+from extractor.config import config
 
 
 def run_etl_pipeline():
